@@ -1,0 +1,75 @@
+name: seal-build
+
+# log4j 1.2.17 has no upstream GitHub Actions CI. This workflow reproduces the
+# project's own Maven build (pom.xml), whose `test` phase runs the Ant regression
+# suite in tests/build.xml (target `runAll`) through maven-antrun-plugin.
+# Java 7 (maven:3-jdk-7) is the oldest JDK that still compiles -source/-target 1.4
+# and can reach Maven Central over TLS 1.2.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Ant targets of tests/build.xml to run instead of runAll (e.g. 'Core Minimum'); empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run full test suite (mvn verify -> antrun runAll)
+        if: ${{ inputs.test-filter == '' }}
+        run: |
+          mkdir -p "$HOME/.m2"
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD":/workdir -w /workdir \
+            -v "$HOME/.m2":/root/.m2 \
+            maven:3-jdk-7 \
+            mvn -B -e -Dhttps.protocols=TLSv1.2 clean verify -Dmaven.site.skip=true \
+            2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Build jar and run selected Ant test targets
+        if: ${{ inputs.test-filter != '' }}
+        run: |
+          mkdir -p "$HOME/.m2" "$RUNNER_TEMP/ant"
+          curl -fsSL https://archive.apache.org/dist/ant/binaries/apache-ant-1.9.16-bin.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP/ant" --strip-components=1
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD":/workdir -w /workdir \
+            -v "$HOME/.m2":/root/.m2 \
+            -v "$RUNNER_TEMP/ant":/opt/ant \
+            maven:3-jdk-7 \
+            bash -ec '
+              mvn -B -e -Dhttps.protocols=TLSv1.2 clean test-compile bundle:bundle -Dmaven.site.skip=true
+              cd tests
+              /opt/ant/bin/ant -lib /root/.m2/repository/junit/junit/3.8.1/junit-3.8.1.jar \
+                -Dm2_repo=/root/.m2/repository \
+                -Dlog4j.jar=/workdir/target/classes \
+                -Dproject.lib.home=/workdir/target \
+                ${{ inputs.test-filter }}
+            ' 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Test summary
+        if: always()
+        run: |
+          # Sum the per-suite "Tests run: N, Failures: F, Errors: E" line that Ant's <junit printsummary="yes">
+          # prints right after "[junit] Running <suite>" (the plain formatter repeats it; count it once).
+          awk '/\[junit\] Running / {suite=$NF; want=1; next}
+               want && /Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+/ {
+                 want=0; print suite ": " $0; line=$0
+                 sub(/.*Tests run: /, "", line); split(line, a, /[^0-9]+/)
+                 r+=a[1]; f+=a[2]; e+=a[3]; n++
+               }
+               END {printf "TOTAL: %d suites, %d tests run, %d failures, %d errors, %d passed\n", n, r, f, e, r-f-e}' \
+            "$RUNNER_TEMP/build.log"
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: log4j-jar
+          path: target/log4j-1.2.17.jar
+          if-no-files-found: error
